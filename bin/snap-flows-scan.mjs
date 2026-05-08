@@ -21,6 +21,7 @@
 import {
 	existsSync,
 	mkdirSync,
+	readFileSync,
 	readdirSync,
 	statSync,
 	writeFileSync,
@@ -379,6 +380,80 @@ const screenCount = countScreens(decl.flows);
 console.log(
 	`✓ Wrote ${relative(cwd(), targetTs) || targetTs} — ${flowCount} flow(s), ${screenCount} screen(s)`,
 );
-console.log(
-	`  Pass it to installSnapBridge: import { snapFlows } from "./snap-flows"; installSnapBridge({ projectId, flows: snapFlows });`,
-);
+
+// ── Post-scan checks: layout wiring + package.json shortcut ────────────────
+checkLayoutWiring(appDir, targetTs);
+suggestPackageScript(appDir);
+
+function checkLayoutWiring(appDir, snapFlowsPath) {
+	const layoutCandidates = [
+		join(appDir, "_layout.tsx"),
+		join(appDir, "_layout.jsx"),
+		join(appDir, "_layout.ts"),
+		join(appDir, "_layout.js"),
+	];
+	const layoutPath = layoutCandidates.find((p) => existsSync(p));
+	if (!layoutPath) {
+		console.log("");
+		console.log(
+			"⚠  No root _layout file found in app/ — make sure you're calling",
+		);
+		console.log("   installSnapBridge({ projectId, flows: snapFlows }) somewhere.");
+		return;
+	}
+	const layoutSrc = readFileSyncSafe(layoutPath);
+	const hasInstall = /installSnapBridge\s*\(/.test(layoutSrc);
+	const hasFlows = /flows\s*:\s*snapFlows/.test(layoutSrc);
+	const hasImport = /from\s+['"]\.\.?\/snap-flows['"]/.test(layoutSrc);
+
+	console.log("");
+	if (hasInstall && hasFlows && hasImport) {
+		console.log(
+			`✓ ${relative(cwd(), layoutPath)} is wired up — installSnapBridge({ ..., flows: snapFlows }) found.`,
+		);
+		return;
+	}
+	console.log(
+		`⚠  ${relative(cwd(), layoutPath)} needs a one-time edit. Add at module scope:`,
+	);
+	console.log("");
+	const importPath = relative(dirname(layoutPath), snapFlowsPath)
+		.replace(/\.tsx?$/, "")
+		.replace(/\\/g, "/");
+	const importSpec = importPath.startsWith(".")
+		? importPath
+		: `./${importPath}`;
+	console.log(`   import { installSnapBridge } from "@unicorn-studio/snap-bridge";`);
+	console.log(`   import { snapFlows } from "${importSpec}";`);
+	console.log("");
+	console.log(`   installSnapBridge({ projectId: "<your-slug>", flows: snapFlows });`);
+}
+
+function suggestPackageScript(appDir) {
+	// `mobile/package.json` lives next to `mobile/app/`. Find it.
+	const pkgPath = join(dirname(appDir), "package.json");
+	if (!existsSync(pkgPath)) return;
+	let pkg;
+	try {
+		pkg = JSON.parse(readFileSyncSafe(pkgPath));
+	} catch {
+		return;
+	}
+	const scripts = pkg.scripts ?? {};
+	if (scripts.flows === "snap-flows-scan") return; // already added
+	console.log("");
+	console.log(
+		`💡 Tip — add "flows": "snap-flows-scan" to ${relative(cwd(), pkgPath)} scripts.`,
+	);
+	console.log(
+		"   Then a route change is just: pnpm flows  (instead of pnpm exec snap-flows-scan)",
+	);
+}
+
+function readFileSyncSafe(p) {
+	try {
+		return readFileSync(p, "utf8");
+	} catch {
+		return "";
+	}
+}
