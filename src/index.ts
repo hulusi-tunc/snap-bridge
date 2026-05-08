@@ -107,6 +107,12 @@ interface InternalState {
 	reconnectTimer: ReturnType<typeof setTimeout> | null;
 	snapshot: SnapState;
 	installed: boolean;
+	/**
+	 * The current screen's scrollable view ref, set by `registerSnapTarget`.
+	 * Used by `react-native-view-shot` to capture beyond the viewport so
+	 * the desktop tool sees the full page (including off-screen content).
+	 */
+	captureTarget: { current: unknown } | null;
 }
 
 const internal: InternalState = {
@@ -122,6 +128,7 @@ const internal: InternalState = {
 	reconnectTimer: null,
 	snapshot: { route: "/" },
 	installed: false,
+	captureTarget: null,
 };
 
 const isDev = (): boolean => {
@@ -139,6 +146,31 @@ const isDev = (): boolean => {
  */
 export function setSnapState(patch: Partial<SnapState>): void {
 	internal.snapshot = { ...internal.snapshot, ...patch };
+}
+
+/**
+ * Register the current screen's scrollable view ref so the desktop tool
+ * can capture the FULL page (off-screen content too), not just the
+ * visible viewport. Call on mount, pass `null` on unmount.
+ *
+ * @example
+ * ```tsx
+ * function MyScreen() {
+ *   const ref = useRef(null);
+ *   useEffect(() => {
+ *     registerSnapTarget(ref);
+ *     return () => registerSnapTarget(null);
+ *   }, []);
+ *   return <ScrollView ref={ref}>{children}</ScrollView>;
+ * }
+ * ```
+ *
+ * Requires `react-native-view-shot` to be installed in the host app.
+ */
+export function registerSnapTarget<T>(
+	ref: { current: T | null } | null,
+): void {
+	internal.captureTarget = ref as { current: unknown } | null;
 }
 
 /**
@@ -226,6 +258,8 @@ function connect(): void {
 			});
 		} else if (cmd === "ping") {
 			send({ kind: "pong", id, ts: Date.now() });
+		} else if (cmd === "capture-full-page") {
+			void handleCaptureFullPage(id);
 		}
 	};
 
@@ -248,6 +282,54 @@ function scheduleReconnect(): void {
 		internal.reconnectTimer = null;
 		if (internal.installed) connect();
 	}, internal.options.reconnectMs);
+}
+
+/**
+ * Capture the registered SnapTarget as a base64 PNG and reply over WS.
+ * Uses `react-native-view-shot` (lazily required so the bridge stays
+ * installable without it — full-page just won't work). For ScrollView
+ * refs, view-shot captures the entire content size, not just the
+ * visible viewport.
+ */
+async function handleCaptureFullPage(id: string | undefined): Promise<void> {
+	if (!internal.captureTarget?.current) {
+		send({
+			kind: "capture",
+			id,
+			ok: false,
+			error:
+				"No SnapTarget registered — call registerSnapTarget(scrollViewRef) on mount.",
+		});
+		return;
+	}
+	let viewShot: { captureRef: (...args: unknown[]) => Promise<string> };
+	try {
+		// eslint-disable-next-line @typescript-eslint/no-require-imports
+		viewShot = require("react-native-view-shot");
+	} catch {
+		send({
+			kind: "capture",
+			id,
+			ok: false,
+			error:
+				"react-native-view-shot not installed. Run: npm install react-native-view-shot && npx pod-install",
+		});
+		return;
+	}
+	try {
+		const base64 = await viewShot.captureRef(
+			internal.captureTarget as unknown,
+			{ format: "png", result: "base64", quality: 1 },
+		);
+		send({ kind: "capture", id, ok: true, image: base64 });
+	} catch (err) {
+		send({
+			kind: "capture",
+			id,
+			ok: false,
+			error: (err as Error)?.message ?? String(err),
+		});
+	}
 }
 
 function send(payload: Record<string, unknown>): void {
