@@ -10,7 +10,10 @@
       "default": "./src/index.ts"
     }
   },
-  "files": ["src", "README.md"],
+  "files": ["src", "bin", "examples", "README.md"],
+  "bin": {
+    "snap-bridge-init": "./bin/snap-bridge-init.mjs"
+  },
   "peerDependencies": {
     "react-native": "*"
   },
