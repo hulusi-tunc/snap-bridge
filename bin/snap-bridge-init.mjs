@@ -288,8 +288,70 @@ useEffect(() => {
 `;
 }
 
+// ── CLI flags ───────────────────────────────────────────────────────────────
+function parseArgs(argv) {
+	const out = {};
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i];
+		if (!a.startsWith("--")) continue;
+		const eqIdx = a.indexOf("=");
+		if (eqIdx > -1) {
+			out[a.slice(2, eqIdx)] = a.slice(eqIdx + 1);
+		} else {
+			const next = argv[i + 1];
+			if (next && !next.startsWith("--")) {
+				out[a.slice(2)] = next;
+				i++;
+			} else {
+				out[a.slice(2)] = "true";
+			}
+		}
+	}
+	return out;
+}
+
+function usage() {
+	console.log(`
+${BOLD("snap-bridge init")} — onboard a customer RN repo to Unicorn Studio.
+
+${BOLD("Usage")}
+  snap-bridge-init [options]
+
+${BOLD("Options")}
+  --slug <kebab-case>           required if non-interactive
+  --name <"Display Name">       defaults to slug if omitted
+  --platform <ios|android|web>  defaults to ios
+  --platform-url <url>          defaults to http://localhost:3010
+  --token <pgt_xxx>             reuse an existing project token
+  --setup-token <setup_xxx>     create a new app on the platform
+  --yes                         skip ALL prompts (use defaults / flags)
+  --help                        show this message
+
+${BOLD("Examples")}
+  # interactive
+  snap-bridge-init
+
+  # fully scripted (no TTY needed)
+  snap-bridge-init --yes \\
+    --slug acme-fitness \\
+    --name "Acme Fitness" \\
+    --platform ios \\
+    --platform-url http://localhost:3010 \\
+    --setup-token setup_xxx
+
+  # reuse a token
+  snap-bridge-init --slug acme-fitness --token pgt_xxx
+`);
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 async function main() {
+	const args = parseArgs(process.argv.slice(2));
+	if (args.help === "true") {
+		usage();
+		return;
+	}
+	const yes = args.yes === "true";
 	const cwd = process.cwd();
 	console.log("");
 	console.log(BOLD("snap-bridge init"));
@@ -312,39 +374,46 @@ async function main() {
 	ok(`root layout:   ${relative(workspaceRoot, layoutPath)}`);
 	console.log("");
 
-	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	const needsRl = !yes && (!args.slug || !args.name || !args.platform || (!args.token && !args["setup-token"]));
+	const rl = needsRl
+		? createInterface({ input: process.stdin, output: process.stdout })
+		: null;
 
 	const defaultSlug = basename(workspaceRoot)
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-|-$/g, "");
-	let slug = "";
-	while (!SLUG_RE.test(slug)) {
-		slug = await prompt(rl, "Project slug", defaultSlug);
-		if (!SLUG_RE.test(slug)) {
-			console.log(RED("  must be lowercase kebab-case (a–z, 0–9, hyphens)."));
+	let slug = args.slug ?? "";
+	if (!yes) {
+		while (!SLUG_RE.test(slug)) {
+			slug = await prompt(rl, "Project slug", defaultSlug);
+			if (!SLUG_RE.test(slug)) {
+				console.log(RED("  must be lowercase kebab-case (a–z, 0–9, hyphens)."));
+			}
 		}
 	}
-	const name = await prompt(rl, "Display name", slug);
-	const platform = (await prompt(rl, "Platform (ios | android | web)", "ios")).toLowerCase();
+	if (!SLUG_RE.test(slug)) die(`--slug "${slug}" is missing or invalid (lowercase kebab-case).`);
+
+	const name = args.name ?? (yes ? slug : await prompt(rl, "Display name", slug));
+	const platform = (
+		args.platform ??
+		(yes ? "ios" : await prompt(rl, "Platform (ios | android | web)", "ios"))
+	).toLowerCase();
 	if (!["ios", "android", "web"].includes(platform)) {
 		die(`Invalid platform "${platform}".`);
 	}
 
-	console.log("");
-	const haveToken = (await prompt(rl, "Already have a project token? (y/N)", "n")).toLowerCase();
+	const platformUrl =
+		args["platform-url"] ??
+		(yes ? "http://localhost:3010" : await prompt(rl, "Platform URL", "http://localhost:3010"));
 
-	let projectToken;
-	let platformUrl;
-	if (haveToken === "y" || haveToken === "yes") {
-		platformUrl = await prompt(rl, "Platform URL", "http://localhost:3010");
-		projectToken = await promptHidden(rl, "Project token (pgt_…)");
-		if (!projectToken.startsWith("pgt_")) {
-			die("Project token should start with 'pgt_'.");
-		}
-	} else {
-		platformUrl = await prompt(rl, "Platform URL", "http://localhost:3010");
-		const setupToken = await promptHidden(rl, "Setup token (server-side SETUP_TOKEN)");
+	let projectToken = args.token;
+	if (!projectToken) {
+		const setupToken =
+			args["setup-token"] ??
+			(yes
+				? die("Either --token or --setup-token is required when --yes is set.")
+				: await promptHidden(rl, "Setup token (server-side SETUP_TOKEN)"));
 		if (!setupToken) die("Setup token is required to create a new project.");
 		try {
 			const result = await createProject({
@@ -359,6 +428,8 @@ async function main() {
 		} catch (err) {
 			die(`Platform call failed: ${err.message}`);
 		}
+	} else if (!projectToken.startsWith("pgt_")) {
+		die("Project token should start with 'pgt_'.");
 	}
 
 	console.log("");
@@ -407,7 +478,7 @@ async function main() {
 	ok(`registered with Unicorn Capture (${capturePath})`);
 
 	// Done
-	rl.close();
+	rl?.close();
 	console.log("");
 	console.log(BOLD("─── Add to your root layout ───"));
 	console.log("");
