@@ -1,0 +1,384 @@
+#!/usr/bin/env node
+/**
+ * snap-flows-scan
+ *
+ * Walks an Expo Router `app/` directory and emits a `snap-flows.ts`
+ * skeleton that conforms to `@unicorn-studio/snap-bridge`'s
+ * `SnapFlowsDeclaration` schema.
+ *
+ * Conventions:
+ *   - Folders → flows / sub-flows
+ *   - Files (`.tsx`/`.ts`/`.jsx`/`.js`) → screens
+ *   - `_layout.*`, `_*` → skipped (Expo Router layouts)
+ *   - `(group)` segments → stripped from the route, ignored for grouping
+ *   - `[param]` → `:param` in the route
+ *   - Auth-shaped names (sign-in, sign-up, login, register, …) auto-group
+ *     into an "auth" flow
+ *
+ * Usage:
+ *   pnpm exec snap-flows-scan [--app-dir <path>] [--out <path>] [--dry-run]
+ */
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+import { argv, cwd, exit } from "node:process";
+
+// ════════════════════════════════════════════════════════════════════════════
+// constants + helpers (declared first so the entry-point block below can
+// freely reference them — node ESM doesn't hoist `const`s)
+// ════════════════════════════════════════════════════════════════════════════
+
+const SCREEN_EXT = /\.(tsx|ts|jsx|js)$/;
+
+const AUTH_PATTERNS = new Set([
+	"sign-in",
+	"sign-up",
+	"signin",
+	"signup",
+	"login",
+	"logout",
+	"register",
+	"forgot-password",
+	"reset-password",
+	"verify",
+	"verify-email",
+	"otp",
+]);
+
+function fileToRoute(relPath) {
+	let r = relPath
+		.replace(SCREEN_EXT, "")
+		.replace(/\.(ios|android|native|web)$/, "") // platform-specific files
+		.replace(/\/index$/, "");
+	const segs = r
+		.split("/")
+		.filter((s) => s && !(s.startsWith("(") && s.endsWith(")")));
+	let route = `/${segs.join("/")}`;
+	route = route.replace(/\[(\.{3})?(\w+)\]/g, ":$2");
+	if (route === "") route = "/";
+	if (!route.startsWith("/")) route = `/${route}`;
+	return route === "//" ? "/" : route;
+}
+
+function topSegment(route) {
+	if (route === "/") return "main";
+	const segs = route.split("/").filter(Boolean);
+	const first = segs[0] ?? "main";
+	if (AUTH_PATTERNS.has(first)) return "auth";
+	return first.replace(/^:/, "");
+}
+
+function deriveScreenName(route) {
+	if (route === "/") return "Home";
+	const segs = route.split("/").filter(Boolean);
+	const last = segs[segs.length - 1] ?? "screen";
+	if (last.startsWith(":")) {
+		// Dynamic param at the end — name from the parent segment
+		// (e.g. `/reservation/:id` → "Reservation Detail").
+		const parent = segs[segs.length - 2];
+		if (parent && !parent.startsWith(":")) {
+			return `${titleize(parent)} Detail`;
+		}
+		return titleize(last.slice(1));
+	}
+	return titleize(last);
+}
+
+function titleize(s) {
+	return s
+		.replace(/[-_]+/g, " ")
+		.split(/\s+/)
+		.filter(Boolean)
+		.map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+		.join(" ");
+}
+
+function routeToScreen(r) {
+	return { route: r.route, name: deriveScreenName(r.route) };
+}
+
+function countFlows(flows) {
+	let n = 0;
+	for (const f of flows) {
+		n += 1;
+		if (f.flows) n += countFlows(f.flows);
+	}
+	return n;
+}
+
+function countScreens(flows) {
+	let n = 0;
+	for (const f of flows) {
+		n += (f.screens ?? []).length;
+		if (f.flows) n += countScreens(f.flows);
+	}
+	return n;
+}
+
+function buildFlowNode(flowId, flowRoutes) {
+	// Routes with 3+ path segments AND a 2nd-segment shared by ≥2 siblings →
+	// promote that 2nd segment into a sub-flow.
+	// e.g. /booking/payment/method + /booking/payment/details → "payment" sub-flow.
+	const direct = [];
+	const subBuckets = new Map();
+	for (const r of flowRoutes) {
+		const segs = r.route.split("/").filter(Boolean);
+		if (segs.length <= 2 || flowId === "auth" || flowId === "main") {
+			direct.push(r);
+			continue;
+		}
+		const subKey = segs[1].replace(/^:/, "");
+		const list = subBuckets.get(subKey) ?? [];
+		list.push(r);
+		subBuckets.set(subKey, list);
+	}
+
+	const subFlows = [];
+	for (const [subKey, subRoutes] of subBuckets) {
+		if (subRoutes.length >= 2) {
+			subFlows.push({
+				id: `${flowId}-${subKey}`,
+				name: titleize(subKey),
+				screens: subRoutes.map(routeToScreen),
+			});
+		} else {
+			direct.push(...subRoutes);
+		}
+	}
+
+	const node = {
+		id: flowId,
+		name: titleize(flowId),
+		screens: direct.map(routeToScreen),
+	};
+	if (subFlows.length > 0) {
+		node.flows = subFlows;
+	}
+	return node;
+}
+
+function buildDeclaration(routes) {
+	const byFlow = new Map();
+	for (const r of routes) {
+		const flowId = topSegment(r.route);
+		const list = byFlow.get(flowId) ?? [];
+		list.push(r);
+		byFlow.set(flowId, list);
+	}
+
+	const flows = [];
+	for (const [flowId, flowRoutes] of byFlow) {
+		flows.push(buildFlowNode(flowId, flowRoutes));
+	}
+
+	// Nice ordering: auth first, main second, then alphabetical.
+	flows.sort((a, b) => {
+		if (a.id === "auth") return -1;
+		if (b.id === "auth") return 1;
+		if (a.id === "main") return -1;
+		if (b.id === "main") return 1;
+		return a.id.localeCompare(b.id);
+	});
+
+	return { version: 1, flows };
+}
+
+function renderFlow(f, indent) {
+	const inner = `${indent}\t`;
+	const screens = (f.screens ?? [])
+		.map(
+			(s) =>
+				`${inner}\t{ route: ${JSON.stringify(s.route)}, name: ${JSON.stringify(s.name)} }`,
+		)
+		.join(",\n");
+	const subFlows = f.flows ? renderFlows(f.flows, inner) : null;
+	const lines = [];
+	lines.push(`${indent}{`);
+	lines.push(`${inner}id: ${JSON.stringify(f.id)},`);
+	lines.push(`${inner}name: ${JSON.stringify(f.name)},`);
+	if (screens) {
+		lines.push(`${inner}screens: [`);
+		lines.push(screens);
+		lines.push(`${inner}],`);
+	}
+	if (subFlows) {
+		lines.push(`${inner}flows: [`);
+		lines.push(subFlows);
+		lines.push(`${inner}],`);
+	}
+	lines.push(`${indent}}`);
+	return lines.join("\n");
+}
+
+function renderFlows(flows, indent) {
+	return flows.map((f) => renderFlow(f, indent)).join(",\n");
+}
+
+function renderTs(decl) {
+	const body = renderFlows(decl.flows, "\t\t");
+	return `/**
+ * Auto-generated by @unicorn-studio/snap-bridge's snap-flows-scan CLI.
+ *
+ * Re-run \`pnpm exec snap-flows-scan\` after adding/removing routes —
+ * this regenerates from your app/ folder. Capture preserves your runtime
+ * customizations (rename, drag-reorder, manual flow grouping) in its own
+ * manifest, so regenerating here does NOT undo those.
+ *
+ * To refine the auto-grouping (split flows differently, add stateHash
+ * filters, etc.), edit this file by hand or with Claude Code.
+ */
+import type { SnapFlowsDeclaration } from "@unicorn-studio/snap-bridge";
+
+export const snapFlows: SnapFlowsDeclaration = {
+\tversion: 1,
+\tflows: [
+${body},
+\t],
+};
+`;
+}
+
+function printHelp() {
+	console.log(`
+snap-flows-scan — generate snap-flows.ts from your Expo Router app/ folder
+
+Usage:
+  pnpm exec snap-flows-scan [options]
+
+Options:
+  --app-dir <path>   Path to the app/ directory.
+                     Default: auto-detected (app/, mobile/app/, apps/mobile/app/, src/app/)
+  --out <path>       Path to write snap-flows.ts.
+                     Default: <parent-of-app>/snap-flows.ts
+  --dry-run          Print the result instead of writing.
+  -h, --help         Show this help.
+
+Re-run any time you add or remove routes. Capture preserves runtime edits
+(rename, drag-reorder) in its own manifest, so regenerating doesn't reset
+those.
+`);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// arg parsing
+// ════════════════════════════════════════════════════════════════════════════
+const args = argv.slice(2);
+let appDirArg = null;
+let outFile = null;
+let dryRun = false;
+
+for (let i = 0; i < args.length; i++) {
+	const a = args[i];
+	if ((a === "--app-dir" || a === "-d") && args[i + 1]) {
+		appDirArg = args[++i];
+	} else if ((a === "--out" || a === "-o") && args[i + 1]) {
+		outFile = args[++i];
+	} else if (a === "--dry-run") {
+		dryRun = true;
+	} else if (a === "-h" || a === "--help") {
+		printHelp();
+		exit(0);
+	} else {
+		console.error(`Unknown arg: ${a}`);
+		printHelp();
+		exit(1);
+	}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// locate `app/`
+// ════════════════════════════════════════════════════════════════════════════
+function resolveAppDir() {
+	if (appDirArg) {
+		const abs = resolve(appDirArg);
+		if (existsSync(abs) && statSync(abs).isDirectory()) return abs;
+		console.error(`--app-dir not found: ${abs}`);
+		exit(1);
+	}
+	for (const candidate of [
+		"app",
+		"mobile/app",
+		"apps/mobile/app",
+		"src/app",
+	]) {
+		const full = join(cwd(), candidate);
+		if (existsSync(full) && statSync(full).isDirectory()) return full;
+	}
+	return null;
+}
+
+const appDir = resolveAppDir();
+if (!appDir) {
+	console.error(
+		"Could not find an Expo Router `app/` directory. Pass --app-dir <path>.",
+	);
+	console.error(`Tried: app/, mobile/app/, apps/mobile/app/, src/app/`);
+	exit(1);
+}
+
+const projectAppDir = relative(cwd(), appDir) || appDir;
+console.log(`Scanning ${projectAppDir}/...`);
+
+const targetTs = outFile
+	? resolve(outFile)
+	: join(dirname(appDir), "snap-flows.ts");
+
+// ════════════════════════════════════════════════════════════════════════════
+// walk + build
+// ════════════════════════════════════════════════════════════════════════════
+const routes = [];
+
+function walk(dir, baseRel) {
+	for (const entry of readdirSync(dir)) {
+		if (entry.startsWith(".") || entry.startsWith("_")) continue;
+		const full = join(dir, entry);
+		const stat = statSync(full);
+		if (stat.isDirectory()) {
+			walk(full, `${baseRel}/${entry}`);
+			continue;
+		}
+		if (!SCREEN_EXT.test(entry)) continue;
+		if (/\.(test|spec|stories|d)\./.test(entry)) continue;
+		const route = fileToRoute(`${baseRel}/${entry}`);
+		if (!routes.some((r) => r.route === route)) {
+			routes.push({ route, file: entry, dirPath: baseRel });
+		}
+	}
+}
+
+walk(appDir, "");
+routes.sort((a, b) => a.route.localeCompare(b.route));
+
+if (routes.length === 0) {
+	console.error("No screens found under the app dir.");
+	exit(1);
+}
+
+const decl = buildDeclaration(routes);
+const tsContent = renderTs(decl);
+
+if (dryRun) {
+	console.log(`\n--- ${relative(cwd(), targetTs) || targetTs} ---\n`);
+	process.stdout.write(tsContent);
+	const flowCount = countFlows(decl.flows);
+	const screenCount = countScreens(decl.flows);
+	console.log(`\n(dry run — ${flowCount} flow(s), ${screenCount} screen(s))`);
+	exit(0);
+}
+
+mkdirSync(dirname(targetTs), { recursive: true });
+writeFileSync(targetTs, tsContent);
+
+const flowCount = countFlows(decl.flows);
+const screenCount = countScreens(decl.flows);
+console.log(
+	`✓ Wrote ${relative(cwd(), targetTs) || targetTs} — ${flowCount} flow(s), ${screenCount} screen(s)`,
+);
+console.log(
+	`  Pass it to installSnapBridge: import { snapFlows } from "./snap-flows"; installSnapBridge({ projectId, flows: snapFlows });`,
+);
