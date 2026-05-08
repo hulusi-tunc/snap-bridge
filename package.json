@@ -1,6 +1,6 @@
 {
   "name": "@unicorn-studio/snap-bridge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Tiny RN dev-dep that exposes the running app's nav state to the Unicorn Capture desktop tool over WebSocket. Framework-agnostic — caller pushes route/state via setSnapState.",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
@@ -13,7 +13,8 @@
   "files": ["src", "bin", "examples", "README.md"],
   "bin": {
     "snap-bridge-init": "./bin/snap-bridge-init.mjs",
-    "snap-flows-scan": "./bin/snap-flows-scan.mjs"
+    "snap-flows-scan": "./bin/snap-flows-scan.mjs",
+    "snap-bridge-setup": "./bin/snap-bridge-setup.mjs"
   },
   "peerDependencies": {
     "react-native": "*"
