@@ -31,9 +31,11 @@ const SELF_DIR = dirname(fileURLToPath(import.meta.url));
 const SNAP_BRIDGE_DIR = resolve(SELF_DIR, "..");
 
 // Where designers' npm install pulls @unicorn-studio/snap-bridge from.
+// Pinned to a tag — without one, every fresh install resolves to the
+// commit that was at HEAD at install time and stays there forever.
 // Override with SNAP_BRIDGE_GIT to test a fork or a feature branch.
 const DEFAULT_GIT_URL =
-	"git+ssh://git@github.com/hulusi-tunc/snap-bridge.git";
+	"github:hulusi-tunc/snap-bridge#v0.4.2";
 const SNAP_BRIDGE_INSTALL_REF =
 	process.env.SNAP_BRIDGE_GIT ?? DEFAULT_GIT_URL;
 
