@@ -317,9 +317,18 @@ async function handleCaptureFullPage(id: string | undefined): Promise<void> {
 		return;
 	}
 	try {
+		// `snapshotContentContainer: true` is the magic flag — without it
+		// view-shot only captures the visible viewport of a ScrollView.
+		// With it, the entire scrollable content (incl. off-screen) ends
+		// up in the PNG, which is the whole point of "full-page" capture.
 		const base64 = await viewShot.captureRef(
 			internal.captureTarget as unknown,
-			{ format: "png", result: "base64", quality: 1 },
+			{
+				format: "png",
+				result: "base64",
+				quality: 1,
+				snapshotContentContainer: true,
+			} as Record<string, unknown>,
 		);
 		send({ kind: "capture", id, ok: true, image: base64 });
 	} catch (err) {
