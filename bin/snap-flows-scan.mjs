@@ -99,6 +99,51 @@ function titleize(s) {
 		.join(" ");
 }
 
+/**
+ * Pull every `route: "..."` value out of an existing snap-flows.ts. Naive
+ * regex (the file is hand-curated TS, not arbitrary JS), but reliable
+ * for snap-flows.ts shapes since route values are always string literals.
+ */
+function extractDeclaredRoutes(src) {
+	const set = new Set();
+	const re = /route\s*:\s*["'`]([^"'`]+)["'`]/g;
+	let m;
+	while ((m = re.exec(src))) {
+		if (m[1]) set.add(m[1]);
+	}
+	return set;
+}
+
+/**
+ * Insert a "Recently added" flow as the first child of the top-level
+ * `flows: [ ... ]` array. Returns the patched file source. Lookup uses
+ * the marker pattern `version: 1,\n\tflows: [` so we land in the right
+ * array (not a nested sub-flow's `flows`). Bails — returns src unchanged —
+ * if the marker isn't found, since we'd rather no-op than corrupt.
+ */
+function appendRecentlyAddedFlow(src, newRoutes) {
+	const marker = "flows: [";
+	const idx = src.indexOf(marker);
+	if (idx === -1) return src;
+	const insertAt = idx + marker.length;
+	const insertion =
+		"\n" +
+		[
+			"\t\t{",
+			'\t\t\tid: "recently-added",',
+			'\t\t\tname: "Recently added",',
+			"\t\t\tscreens: [",
+			...newRoutes.map((r, i) => {
+				const screen = routeToScreen(r);
+				const trailing = i === newRoutes.length - 1 ? "" : ",";
+				return `\t\t\t\t{ route: ${JSON.stringify(screen.route)}, name: ${JSON.stringify(screen.name)} }${trailing}`;
+			}),
+			"\t\t\t],",
+			"\t\t},",
+		].join("\n");
+	return src.slice(0, insertAt) + insertion + src.slice(insertAt);
+}
+
 function routeToScreen(r) {
 	return { route: r.route, name: deriveScreenName(r.route) };
 }
@@ -256,12 +301,17 @@ Options:
                      Default: auto-detected (app/, mobile/app/, apps/mobile/app/, src/app/)
   --out <path>       Path to write snap-flows.ts.
                      Default: <parent-of-app>/snap-flows.ts
-  --dry-run          Print the result instead of writing.
+  --merge, -m        ADDITIVE mode (recommended after initial setup): keeps
+                     your curated snap-flows.ts intact, adds any new routes
+                     under a "Recently added" flow. Stale routes are NOT
+                     auto-removed — review by hand. Use without --merge to
+                     regenerate from scratch (overwrites curation).
+  --dry-run          Print the result without writing.
   -h, --help         Show this help.
 
-Re-run any time you add or remove routes. Capture preserves runtime edits
-(rename, drag-reorder) in its own manifest, so regenerating doesn't reset
-those.
+Day-1 setup: run without flags to seed snap-flows.ts.
+Day-N iteration: run with --merge after adding/removing routes; then re-run
+the improver in Capture to re-group new routes into the right user-journey.
 `);
 }
 
@@ -272,6 +322,7 @@ const args = argv.slice(2);
 let appDirArg = null;
 let outFile = null;
 let dryRun = false;
+let mergeMode = false;
 
 for (let i = 0; i < args.length; i++) {
 	const a = args[i];
@@ -281,6 +332,8 @@ for (let i = 0; i < args.length; i++) {
 		outFile = args[++i];
 	} else if (a === "--dry-run") {
 		dryRun = true;
+	} else if (a === "--merge" || a === "-m") {
+		mergeMode = true;
 	} else if (a === "-h" || a === "--help") {
 		printHelp();
 		exit(0);
@@ -358,6 +411,79 @@ routes.sort((a, b) => a.route.localeCompare(b.route));
 if (routes.length === 0) {
 	console.error("No screens found under the app dir.");
 	exit(1);
+}
+
+// Merge mode is the day-2 path: keep the user's curated snap-flows.ts
+// (improver-refined grouping, hand-edits, sub-flows) intact, but ADD
+// any routes that exist in app/ but aren't yet declared. New routes
+// land in a "Recently added" bucket at the top so they're easy to
+// re-group via the next improver pass.
+if (mergeMode) {
+	if (!existsSync(targetTs)) {
+		console.log(
+			`⚠  No existing ${relative(cwd(), targetTs) || targetTs} — falling back to full generation. (use without --merge to clarify intent)`,
+		);
+		// Fall through to full-write path
+	} else {
+		const existingSrc = readFileSync(targetTs, "utf8");
+		const existingRoutes = extractDeclaredRoutes(existingSrc);
+		const scannedRoutes = new Set(routes.map((r) => r.route));
+		const newRoutes = routes.filter((r) => !existingRoutes.has(r.route));
+		const removedRoutes = [...existingRoutes].filter(
+			(r) => !scannedRoutes.has(r),
+		);
+
+		if (newRoutes.length === 0 && removedRoutes.length === 0) {
+			console.log(
+				`✓ ${relative(cwd(), targetTs) || targetTs} already in sync — no changes.`,
+			);
+			exit(0);
+		}
+
+		if (dryRun) {
+			console.log(`\n--- merge dry run ---`);
+			if (newRoutes.length > 0) {
+				console.log(`  + ${newRoutes.length} new route(s):`);
+				for (const r of newRoutes) console.log(`      ${r.route}`);
+			}
+			if (removedRoutes.length > 0) {
+				console.log(
+					`  - ${removedRoutes.length} stale route(s) (still in file but not in app/):`,
+				);
+				for (const r of removedRoutes) console.log(`      ${r}`);
+			}
+			console.log(
+				`\n(merge dry run — would patch existing file in place; stale routes are NOT auto-removed)`,
+			);
+			exit(0);
+		}
+
+		// Patch the file: insert a "Recently added" sub-flow node right
+		// after the opening `flows: [` so new routes are obvious. We
+		// don't touch existing entries, even if their routes disappeared
+		// from app/ — those become "dangling" but stale flow pruning on
+		// the desktop side handles that gracefully.
+		if (newRoutes.length > 0) {
+			const patched = appendRecentlyAddedFlow(existingSrc, newRoutes);
+			writeFileSync(targetTs, patched);
+			console.log(
+				`✓ Merged ${newRoutes.length} new route${newRoutes.length === 1 ? "" : "s"} into ${relative(cwd(), targetTs) || targetTs} under "Recently added".`,
+			);
+			console.log(
+				`  Re-run the improver (Capture's "✨ Improve" button) to fold them into the right user-journey flows.`,
+			);
+		}
+		if (removedRoutes.length > 0) {
+			console.log(
+				`ℹ  ${removedRoutes.length} route${removedRoutes.length === 1 ? " is" : "s are"} still in the file but no longer in app/ — review by hand if they're truly gone:`,
+			);
+			for (const r of removedRoutes) console.log(`      ${r}`);
+		}
+
+		// Skip layout wiring + package script suggestions on merge — they're
+		// noise once the project is past initial setup.
+		exit(0);
+	}
 }
 
 const decl = buildDeclaration(routes);

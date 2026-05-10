@@ -244,23 +244,69 @@ export function registerSnapTarget<T>(
 /**
  * Open a long-lived WebSocket to the Unicorn Capture desktop tool.
  * Auto-reconnects on disconnect. No-ops in production builds.
+ *
+ * Idempotent under Metro hot-reload: when called a second time (because
+ * the host module re-evaluated after editing snap-flows.ts) we DON'T
+ * re-open the socket — we just replace `internal.options.flows` with
+ * the new declaration and re-send the hello frame over the existing
+ * connection. Capture's `ingestDeclaration` is upsert + prune, so the
+ * sidebar updates without an iOS-sim Cmd+R.
+ *
+ * If projectId/host/port changes between calls, that's the only case
+ * where we tear down and reconnect — those are connection-level keys.
  */
 export function installSnapBridge(opts: InstallOptions): void {
 	if (!isDev()) return;
-	if (internal.installed) {
-		internal.options.log(
-			"installSnapBridge called twice — ignoring second call.",
-		);
-		return;
-	}
 	if (typeof WebSocket === "undefined") {
 		console.warn("[snap-bridge] WebSocket is not available; aborting.");
 		return;
 	}
+	const port = opts.port ?? 9876;
+	const host = opts.host ?? "localhost";
+
+	if (internal.installed) {
+		const connectionChanged =
+			internal.options.projectId !== opts.projectId ||
+			internal.options.host !== host ||
+			internal.options.port !== port;
+		if (connectionChanged) {
+			internal.options.log(
+				`installSnapBridge: connection params changed (was ${internal.options.projectId}@${internal.options.host}:${internal.options.port}, now ${opts.projectId}@${host}:${port}). Reconnecting.`,
+			);
+			if (internal.socket) {
+				try {
+					internal.socket.close();
+				} catch {}
+				internal.socket = null;
+			}
+			internal.installed = false;
+			// fall through to fresh install below
+		} else {
+			// Hot-reload path: same connection, possibly fresh flows. Update
+			// internal state and re-send hello so Capture re-ingests.
+			const flowsChanged =
+				JSON.stringify(internal.options.flows ?? null) !==
+				JSON.stringify(opts.flows ?? null);
+			internal.options.flows = opts.flows ?? null;
+			if (opts.log) internal.options.log = opts.log;
+			if (typeof opts.reconnectMs === "number") {
+				internal.options.reconnectMs = opts.reconnectMs;
+			}
+			if (flowsChanged) {
+				const flowCount = opts.flows?.flows.length ?? 0;
+				internal.options.log(
+					`flows updated (${flowCount} top-level flow${flowCount === 1 ? "" : "s"}) — re-emitting hello`,
+				);
+				rehello();
+			}
+			return;
+		}
+	}
+
 	internal.options = {
 		projectId: opts.projectId,
-		port: opts.port ?? 9876,
-		host: opts.host ?? "localhost",
+		port,
+		host,
 		reconnectMs: opts.reconnectMs ?? 3000,
 		log: opts.log ?? ((m) => console.log(`[snap-bridge] ${m}`)),
 		flows: opts.flows ?? null,
@@ -349,6 +395,31 @@ function connect(): void {
 	};
 
 	void reconnectMs; // referenced via scheduleReconnect
+}
+
+/**
+ * Re-send the hello frame over the existing socket. Used after a hot-reload
+ * `installSnapBridge` call: the connection is fine, we just want Capture to
+ * re-ingest the (possibly updated) flow declaration. If the socket isn't
+ * open yet — e.g. we got hot-reloaded between connect() and onopen — the
+ * fresh flows still go out as part of the queued onopen handler since it
+ * reads `internal.options.flows` at fire time.
+ */
+function rehello(): void {
+	const ws = internal.socket;
+	if (!ws || ws.readyState !== WebSocket.OPEN) return;
+	try {
+		ws.send(
+			JSON.stringify({
+				kind: "hello",
+				projectId: internal.options.projectId,
+				pid: typeof process !== "undefined" ? process.pid : undefined,
+				flows: internal.options.flows ?? undefined,
+			}),
+		);
+	} catch (err) {
+		internal.options.log(`rehello failed: ${(err as Error).message}`);
+	}
 }
 
 function scheduleReconnect(): void {
