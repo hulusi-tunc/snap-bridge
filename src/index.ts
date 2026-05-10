@@ -113,6 +113,20 @@ interface InternalState {
 	 * the desktop tool sees the full page (including off-screen content).
 	 */
 	captureTarget: { current: unknown } | null;
+	/**
+	 * App-level context dimensions (role, plan, A/B variant). These feed
+	 * into the auto-derived stateHash so the same route can split into
+	 * distinct screen slots — e.g. "/home" with role=worker vs role=company.
+	 * Set via `setSnapStateContext`. Survives across nav changes; cleared
+	 * only by passing the same key with `null`/`undefined`.
+	 */
+	context: Record<string, string>;
+	/**
+	 * Did the host app set `stateHash` directly via setSnapState? When
+	 * true, we keep that value verbatim and don't auto-derive. Lets users
+	 * opt out of context-based hashing on a per-snapshot basis.
+	 */
+	stateHashLocked: boolean;
 }
 
 const internal: InternalState = {
@@ -129,6 +143,8 @@ const internal: InternalState = {
 	snapshot: { route: "/" },
 	installed: false,
 	captureTarget: null,
+	context: {},
+	stateHashLocked: false,
 };
 
 const isDev = (): boolean => {
@@ -143,9 +159,61 @@ const isDev = (): boolean => {
  * Push the latest nav/state snapshot. Cheap to call — stash, no I/O.
  * Call it from your nav listener (expo-router useSegments / react-navigation
  * onStateChange / etc.).
+ *
+ * If `stateHash` is included in the patch, it locks the snapshot to that
+ * exact value — auto-derived context is ignored until you call
+ * `setSnapState({ stateHash: undefined })` to release the lock.
  */
 export function setSnapState(patch: Partial<SnapState>): void {
+	if ("stateHash" in patch) {
+		if (patch.stateHash === undefined) {
+			internal.stateHashLocked = false;
+		} else {
+			internal.stateHashLocked = true;
+		}
+	}
 	internal.snapshot = { ...internal.snapshot, ...patch };
+}
+
+/**
+ * Register or update app-level context dimensions that feed into the
+ * auto-derived stateHash. Use this for state that the bridge can't
+ * detect on its own — user role, subscription plan, A/B test variant,
+ * feature-flag state. Same route + different context = different
+ * screen slot in Capture (e.g. snap-flows can declare two `/home`
+ * variants with `stateHash: "role=worker"` vs `"role=company"`).
+ *
+ * Pass `null` or `undefined` for a value to clear that key.
+ *
+ * @example
+ * ```ts
+ * useEffect(() => {
+ *   setSnapStateContext({ role: session.role, plan: session.plan });
+ * }, [session.role, session.plan]);
+ * ```
+ */
+export function setSnapStateContext(
+	patch: Record<string, string | null | undefined>,
+): void {
+	for (const [k, v] of Object.entries(patch)) {
+		if (v === null || v === undefined || v === "") {
+			delete internal.context[k];
+		} else {
+			internal.context[k] = String(v);
+		}
+	}
+}
+
+/**
+ * Compose a deterministic stateHash string from the current context map.
+ * Sorted by key, joined `key=value&key=value` — same shape that improver-
+ * generated `stateHash` filters in snap-flows.ts use, so they line up.
+ * Empty context produces "" (no filter).
+ */
+function deriveStateHash(): string {
+	const keys = Object.keys(internal.context).sort();
+	if (keys.length === 0) return "";
+	return keys.map((k) => `${k}=${internal.context[k]}`).join("&");
 }
 
 /**
@@ -249,11 +317,18 @@ function connect(): void {
 				? (msg as { id: string }).id
 				: undefined;
 		if (cmd === "get-state") {
+			// Compose final snapshot: if the host hasn't explicitly set a
+			// stateHash via setSnapState, fold in the auto-derived hash from
+			// the context map. This lets improver-generated `role=worker`
+			// filters Just Work without manual string-building per screen.
+			const liveSnapshot: SnapState = internal.stateHashLocked
+				? internal.snapshot
+				: { ...internal.snapshot, stateHash: deriveStateHash() };
 			send({
 				kind: "state",
 				id,
 				projectId: internal.options.projectId,
-				snapshot: internal.snapshot,
+				snapshot: liveSnapshot,
 				ts: Date.now(),
 			});
 		} else if (cmd === "ping") {

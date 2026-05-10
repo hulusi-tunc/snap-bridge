@@ -274,19 +274,15 @@ function registerWithCapture(payload) {
 function layoutSnippet(slug) {
 	return `// ── @unicorn-studio/snap-bridge wiring ──────────────────────────────────
 // Add the following imports to the TOP of your root layout file:
-import { useEffect } from "react";
-import { usePathname, useSegments } from "expo-router";
-import { installSnapBridge, setSnapState } from "@unicorn-studio/snap-bridge";
+import { installSnapBridge } from "@unicorn-studio/snap-bridge";
+import { useSnapAutoSync } from "@unicorn-studio/snap-bridge/expo-router";
+import { snapFlows } from "../snap-flows";
 
 // At the module level (outside the component), call once:
-installSnapBridge({ projectId: ${JSON.stringify(slug)} });
+installSnapBridge({ projectId: ${JSON.stringify(slug)}, flows: snapFlows });
 
-// Inside your root component, after any \`useFonts\` calls:
-const pathname = usePathname();
-const segments = useSegments();
-useEffect(() => {
-  setSnapState({ route: pathname, navStack: segments });
-}, [pathname, segments]);
+// Inside your root component:
+useSnapAutoSync();
 `;
 }
 
