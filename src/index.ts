@@ -105,6 +105,9 @@ interface InternalState {
 	};
 	socket: WebSocket | null;
 	reconnectTimer: ReturnType<typeof setTimeout> | null;
+	heartbeatTimer: ReturnType<typeof setInterval> | null;
+	heartbeatWatchTimer: ReturnType<typeof setTimeout> | null;
+	lastHeartbeatAckAt: number;
 	snapshot: SnapState;
 	installed: boolean;
 	/**
@@ -140,12 +143,25 @@ const internal: InternalState = {
 	},
 	socket: null,
 	reconnectTimer: null,
+	heartbeatTimer: null,
+	heartbeatWatchTimer: null,
+	lastHeartbeatAckAt: 0,
 	snapshot: { route: "/" },
 	installed: false,
 	captureTarget: null,
 	context: {},
 	stateHashLocked: false,
 };
+
+/** Frequency at which the bridge pings the server. */
+const HEARTBEAT_INTERVAL_MS = 5000;
+/**
+ * Force a reconnect when the bridge hasn't heard a pong in this many ms.
+ * 12s = enough to ride out a single dropped ping but short enough that
+ * Capture rebuild → reconnect cycle stays well under the OS-level TCP
+ * timeout (which can be 30-60s).
+ */
+const HEARTBEAT_TIMEOUT_MS = 12000;
 
 const isDev = (): boolean => {
 	if (typeof __DEV__ !== "undefined") return __DEV__;
@@ -336,6 +352,7 @@ function connect(): void {
 			pid: typeof process !== "undefined" ? process.pid : undefined,
 			flows: internal.options.flows ?? undefined,
 		});
+		startHeartbeat();
 	};
 
 	ws.onmessage = (event) => {
@@ -379,6 +396,10 @@ function connect(): void {
 			});
 		} else if (cmd === "ping") {
 			send({ kind: "pong", id, ts: Date.now() });
+		} else if (cmd === "heartbeat-ack") {
+			// Server confirmed our heartbeat. Stamp lastAck so the watch
+			// timer keeps the socket alive.
+			internal.lastHeartbeatAckAt = Date.now();
 		} else if (cmd === "capture-full-page") {
 			void handleCaptureFullPage(id);
 		}
@@ -390,11 +411,59 @@ function connect(): void {
 
 	ws.onclose = () => {
 		log("disconnected");
+		stopHeartbeat();
 		internal.socket = null;
 		scheduleReconnect();
 	};
 
 	void reconnectMs; // referenced via scheduleReconnect
+}
+
+/**
+ * Start sending heartbeat pings every HEARTBEAT_INTERVAL_MS. The server
+ * replies with `kind: "heartbeat-ack"`; the message handler stamps
+ * `lastHeartbeatAckAt`. A separate watch timer fires every interval to
+ * compare lastAck against now() — if it's been longer than
+ * HEARTBEAT_TIMEOUT_MS, force-close the socket. The browser/RN runtime's
+ * close handler then triggers our scheduleReconnect path, restoring the
+ * connection in ~3s rather than waiting on the OS-level TCP timeout.
+ */
+function startHeartbeat(): void {
+	stopHeartbeat();
+	internal.lastHeartbeatAckAt = Date.now();
+	internal.heartbeatTimer = setInterval(() => {
+		const ws = internal.socket;
+		if (!ws || ws.readyState !== WebSocket.OPEN) return;
+		try {
+			ws.send(JSON.stringify({ kind: "heartbeat", ts: Date.now() }));
+		} catch {
+			// Socket already half-dead — let the watch timer evict it.
+		}
+	}, HEARTBEAT_INTERVAL_MS);
+	internal.heartbeatWatchTimer = setInterval(() => {
+		if (Date.now() - internal.lastHeartbeatAckAt > HEARTBEAT_TIMEOUT_MS) {
+			internal.options.log(
+				`heartbeat timeout (>${HEARTBEAT_TIMEOUT_MS}ms since ack) — closing socket to force reconnect`,
+			);
+			const ws = internal.socket;
+			if (ws) {
+				try {
+					ws.close();
+				} catch {}
+			}
+		}
+	}, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat(): void {
+	if (internal.heartbeatTimer) {
+		clearInterval(internal.heartbeatTimer);
+		internal.heartbeatTimer = null;
+	}
+	if (internal.heartbeatWatchTimer) {
+		clearInterval(internal.heartbeatWatchTimer);
+		internal.heartbeatWatchTimer = null;
+	}
 }
 
 /**
