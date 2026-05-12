@@ -35,8 +35,13 @@ import { dirname, join, relative, resolve } from "node:path";
 import { argv, cwd, exit } from "node:process";
 
 const SCREEN_EXT = /\.(tsx|ts|jsx|js)$/;
-const MARK_OPEN = "/* @snap-target — wrap added by snap-bridge wrap-screen */";
-const MARK_CLOSE = "/* @snap-target end */";
+// JSX comments must be wrapped in curly braces — bare `/* */` inside JSX
+// children renders as a literal string and crashes RN with "Text strings
+// must be rendered within a <Text> component" (ovria + folleli home.tsx
+// both hit this). Keep the braces in the marker string itself so the
+// unwrap regex below still matches deterministically.
+const MARK_OPEN = "{/* @snap-target — wrap added by snap-bridge wrap-screen */}";
+const MARK_CLOSE = "{/* @snap-target end */}";
 
 // ─── helpers shared with snap-flows-scan ──────────────────────────────────
 function fileToRoute(relPath) {
@@ -347,7 +352,10 @@ function removeWrap(src) {
 	// Strip the View wrap block + the marker comments. The fastest, safest
 	// pass is a single regex with the markers as anchors so we don't depend
 	// on the exact indentation we wrote.
-	const re = /\s*\/\*\s*@snap-target[^*]*\*\/\s*<View\s+ref=\{__snapRef\}\s+collapsable=\{false\}>([\s\S]*?)<\/View>\s*\/\*\s*@snap-target end\s*\*\//;
+	// Accept both the legacy bare-comment form `/* … */` and the corrected
+	// JSX-comment form `{/* … */}` so projects wrapped by older CLI
+	// versions still unwrap cleanly when they bump.
+	const re = /\s*\{?\/\*\s*@snap-target[^*]*\*\/\}?\s*<View\s+ref=\{__snapRef\}\s+collapsable=\{false\}>([\s\S]*?)<\/View>\s*\{?\/\*\s*@snap-target end\s*\*\/\}?/;
 	const m = src.match(re);
 	if (!m) {
 		return { ok: false, reason: "wrap markers not found in their expected shape" };

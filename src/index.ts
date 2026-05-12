@@ -543,7 +543,20 @@ async function handleCaptureFullPage(id: string | undefined): Promise<void> {
 			internal.captureTarget as unknown,
 			{ format: "png", result: "base64", quality: 1 },
 		);
-		send({ kind: "capture", id, ok: true, image: base64 });
+		// Measure the snap-target's window-relative rect + capture device
+		// pixel ratio so Capture knows which strips of a regular simctl
+		// screenshot are "chrome" (status bar above, tab bar below) — those
+		// strips get stitched onto the long-page output so sticky chrome
+		// stays visible. Best-effort: any failure here falls back to
+		// chrome-less long-page (existing behavior).
+		const measurements = await measureSnapTarget();
+		send({
+			kind: "capture",
+			id,
+			ok: true,
+			image: base64,
+			measurements: measurements ?? undefined,
+		});
 	} catch (err) {
 		send({
 			kind: "capture",
@@ -552,6 +565,58 @@ async function handleCaptureFullPage(id: string | undefined): Promise<void> {
 			error: (err as Error)?.message ?? String(err),
 		});
 	}
+}
+
+/**
+ * Measure the snap-target's on-screen position via React Native's
+ * `measureInWindow`. Returns coordinates in window points + the device
+ * pixel ratio. Capture multiplies by `pixelRatio` to map back to the
+ * pixel coordinates of an `xcrun simctl io booted screenshot`.
+ */
+async function measureSnapTarget(): Promise<
+	| {
+			x: number;
+			y: number;
+			width: number;
+			height: number;
+			viewportWidth: number;
+			viewportHeight: number;
+			pixelRatio: number;
+	  }
+	| null
+> {
+	const tgt = internal.captureTarget?.current as
+		| { measureInWindow?: (cb: (x: number, y: number, w: number, h: number) => void) => void }
+		| undefined;
+	if (!tgt || typeof tgt.measureInWindow !== "function") return null;
+	let rn: typeof import("react-native") | null = null;
+	try {
+		// eslint-disable-next-line @typescript-eslint/no-require-imports
+		rn = require("react-native");
+	} catch {
+		return null;
+	}
+	if (!rn) return null;
+	const { Dimensions, PixelRatio } = rn;
+	const win = Dimensions.get("window");
+	const pixelRatio = PixelRatio.get();
+	return new Promise((resolve) => {
+		try {
+			tgt.measureInWindow!((x, y, width, height) => {
+				resolve({
+					x,
+					y,
+					width,
+					height,
+					viewportWidth: win.width,
+					viewportHeight: win.height,
+					pixelRatio,
+				});
+			});
+		} catch {
+			resolve(null);
+		}
+	});
 }
 
 function send(payload: Record<string, unknown>): void {
