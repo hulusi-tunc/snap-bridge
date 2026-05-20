@@ -132,6 +132,22 @@ interface InternalState {
 	stateHashLocked: boolean;
 }
 
+/**
+ * Subscribers for messages the built-in dispatcher doesn't recognise.
+ * Used by the tour handler in `./tour` so the bridge stays a single
+ * socket — no second WS, no second hello — and so unrelated commands
+ * (future `cmd:"act"`, etc.) can be layered on without touching this
+ * file. Known cmds (`get-state`, `ping`, `heartbeat-ack`,
+ * `capture-full-page`) still go through the built-in dispatch first;
+ * subscribers see EVERY parsed message so they can filter as needed.
+ */
+type BridgeMessage = {
+	cmd: string;
+	id?: string;
+	[k: string]: unknown;
+};
+const externalMessageSubscribers = new Set<(msg: BridgeMessage) => void>();
+
 const internal: InternalState = {
 	options: {
 		projectId: "",
@@ -403,6 +419,23 @@ function connect(): void {
 		} else if (cmd === "capture-full-page") {
 			void handleCaptureFullPage(id);
 		}
+		// Fan out to external subscribers (e.g. the tour handler in
+		// `./tour`). Runs AFTER the built-in dispatch so a subscriber
+		// can also observe known cmds if it wants to. Subscribers must
+		// not throw; we catch and log so one bad listener can't kill
+		// the socket's message loop.
+		if (externalMessageSubscribers.size > 0) {
+			const bridgeMsg = msg as BridgeMessage;
+			for (const sub of externalMessageSubscribers) {
+				try {
+					sub(bridgeMsg);
+				} catch (err) {
+					internal.options.log(
+						`message subscriber threw: ${(err as Error).message}`,
+					);
+				}
+			}
+		}
 	};
 
 	ws.onerror = () => {
@@ -653,5 +686,57 @@ export function uninstallSnapBridge(): void {
 export function getCurrentSnapshot(): SnapState {
 	return internal.snapshot;
 }
+
+// ─── Extensibility hooks ──────────────────────────────────────────────────
+// These let companion modules (e.g. `./tour`) ride the bridge's existing
+// WebSocket without spinning up a second connection. Keep this API tiny —
+// it's the only crack between "the bridge owns the socket" and userland.
+
+/**
+ * Subscribe to parsed messages arriving on the bridge socket. Returns
+ * an unsubscribe function. The subscriber sees EVERY parsed `{cmd:…}`
+ * message — known (`get-state`, `ping`, …) and unknown alike — so it
+ * MUST filter by `cmd` before reacting. Subscribers fire after the
+ * built-in dispatch, so a `goto` handler can assume the bridge is in a
+ * sane state when it runs.
+ *
+ * Throwing from a subscriber is caught and logged; we never let one bad
+ * listener take down the message loop.
+ */
+export function subscribeBridgeMessages(
+	fn: (msg: BridgeMessage) => void,
+): () => void {
+	externalMessageSubscribers.add(fn);
+	return () => {
+		externalMessageSubscribers.delete(fn);
+	};
+}
+
+/**
+ * Send an arbitrary JSON payload back to the snap-server over the bridge
+ * socket. No-op if the socket isn't connected — callers don't need to
+ * race against connect/reconnect; the next `goto` from the server will
+ * arrive only after the socket is up anyway.
+ */
+export function sendBridgeMessage(payload: Record<string, unknown>): void {
+	send(payload);
+}
+
+/**
+ * Read the currently-installed projectId. Companion modules use this
+ * when assembling outbound messages (e.g. tour's `kind:"ready"` ack).
+ * Empty string until `installSnapBridge()` has run.
+ */
+export function getBridgeProjectId(): string {
+	return internal.options.projectId;
+}
+
+// ─── Tour re-exports ──────────────────────────────────────────────────────
+// `<SnapTourHandler/>` and `<SnapReady/>` live in `./tour` to keep this
+// file router-agnostic, but we re-export from the root so callers can
+// `import { SnapTourHandler } from "@unicorn-studio/snap-bridge"` per the
+// snap-tour-handler.md sample. The subpath import
+// `@unicorn-studio/snap-bridge/tour` keeps working too.
+export { SnapTourHandler, SnapReady, useSnapReadyHandle } from "./tour";
 
 declare const __DEV__: boolean | undefined;
