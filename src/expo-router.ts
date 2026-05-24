@@ -79,6 +79,7 @@ export function useSnapAutoSync(): void {
 		if (!er) return;
 		setSnapState({
 			route: pathname || "/",
+			routePattern: segmentsToPattern(segments),
 			navStack: segments,
 			extras: { params: normalizeParams(params) },
 		});
@@ -94,4 +95,37 @@ function normalizeParams(
 		out[k] = Array.isArray(v) ? v.join(",") : String(v);
 	}
 	return out;
+}
+
+/**
+ * Translate Expo Router's file-segment list into the `:param` pattern
+ * syntax that Capture's snap-flows declarations already use. Strips
+ * route groups (`(tabs)`) since they don't appear in the URL, and
+ * converts file-based dynamic segments (`[id]`, `[...slug]`, `[[id]]`)
+ * to `:id`. Returns `/` for an empty/root segment list.
+ *
+ * Examples:
+ *   ["reservation", "[id]"]          → "/reservation/:id"
+ *   ["(tabs)", "profile"]            → "/profile"
+ *   ["docs", "[...slug]"]            → "/docs/:slug"
+ *   []                               → "/"
+ */
+function segmentsToPattern(segments: string[]): string {
+	const out: string[] = [];
+	for (const seg of segments) {
+		if (!seg) continue;
+		if (seg.startsWith("(") && seg.endsWith(")")) continue; // route group
+		let cleaned = seg;
+		// Strip outer optional brackets: [[id]] → [id]
+		if (cleaned.startsWith("[[") && cleaned.endsWith("]]")) {
+			cleaned = cleaned.slice(1, -1);
+		}
+		if (cleaned.startsWith("[") && cleaned.endsWith("]")) {
+			const inner = cleaned.slice(1, -1).replace(/^\.\.\./, "");
+			out.push(`:${inner}`);
+		} else {
+			out.push(cleaned);
+		}
+	}
+	return out.length === 0 ? "/" : `/${out.join("/")}`;
 }

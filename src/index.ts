@@ -15,6 +15,15 @@
 export interface SnapState {
 	/** Current route, e.g. "/booking/select-court" */
 	route: string;
+	/**
+	 * Router pattern for the current route with dynamic segments preserved
+	 * — e.g. "/reservation/:id" for a pathname of "/reservation/abc123".
+	 * Capture uses this (when present) to collapse parameterized routes
+	 * into a single auto-flow instead of one flow per concrete id.
+	 * Optional for backwards compat; bridges that don't set this fall
+	 * back to literal-route matching.
+	 */
+	routePattern?: string;
 	/** Stack of route names from root to current, e.g. ["(tabs)", "profile"] */
 	navStack?: string[];
 	/** Hash of relevant runtime state (form values, list lengths, error flags). */
@@ -92,6 +101,17 @@ export interface InstallOptions {
 	 * before snapping anything. Snaps auto-place by route match.
 	 */
 	flows?: SnapFlowsDeclaration;
+	/**
+	 * Stable id for THIS install of the app on THIS device. Sent to the
+	 * desktop in the `hello` frame so reconnects after a hot-reload or
+	 * sim relaunch resume the existing capture session instead of
+	 * spawning a fresh one. When omitted, the bridge tries to derive
+	 * a value automatically from `expo-application` (soft peer dep) —
+	 * works out of the box for Expo apps, no-op for bare RN. Pass a
+	 * value explicitly if you need cross-platform behavior or your own
+	 * id scheme.
+	 */
+	clientId?: string;
 }
 
 interface InternalState {
@@ -102,6 +122,7 @@ interface InternalState {
 		reconnectMs: number;
 		log: (msg: string) => void;
 		flows: SnapFlowsDeclaration | null;
+		clientId: string | null;
 	};
 	socket: WebSocket | null;
 	reconnectTimer: ReturnType<typeof setTimeout> | null;
@@ -156,6 +177,7 @@ const internal: InternalState = {
 		reconnectMs: 3000,
 		log: (m) => console.log(`[snap-bridge] ${m}`),
 		flows: null,
+		clientId: null,
 	},
 	socket: null,
 	reconnectTimer: null,
@@ -342,9 +364,38 @@ export function installSnapBridge(opts: InstallOptions): void {
 		reconnectMs: opts.reconnectMs ?? 3000,
 		log: opts.log ?? ((m) => console.log(`[snap-bridge] ${m}`)),
 		flows: opts.flows ?? null,
+		clientId: opts.clientId ?? deriveExpoClientId(),
 	};
 	internal.installed = true;
 	connect();
+}
+
+/**
+ * Try to read a stable per-install identifier from `expo-application`.
+ * Returns null when expo-application isn't installed (bare RN apps,
+ * web bundles, tests) — the desktop falls back to per-launch session
+ * IDs in that case, matching pre-Item-13 behavior.
+ *
+ * The identifier is composed from `Application.applicationId` plus the
+ * platform-specific install id (`getIosIdForVendorAsync` on iOS or
+ * `getAndroidId` on Android). The async iOS variant is read lazily;
+ * if it's unavailable synchronously, we fall back to the bundle id
+ * alone — still stable across hot-reloads within the same install.
+ */
+function deriveExpoClientId(): string | null {
+	try {
+		// eslint-disable-next-line @typescript-eslint/no-require-imports
+		const ea = require("expo-application") as {
+			applicationId?: string | null;
+			androidId?: string | null;
+		};
+		const bundle = ea?.applicationId ?? "";
+		const android = ea?.androidId ?? "";
+		if (!bundle && !android) return null;
+		return android ? `${bundle}:${android}` : bundle;
+	} catch {
+		return null;
+	}
 }
 
 function connect(): void {
@@ -367,6 +418,7 @@ function connect(): void {
 			projectId: internal.options.projectId,
 			pid: typeof process !== "undefined" ? process.pid : undefined,
 			flows: internal.options.flows ?? undefined,
+			clientId: internal.options.clientId ?? undefined,
 		});
 		startHeartbeat();
 	};
@@ -517,6 +569,7 @@ function rehello(): void {
 				projectId: internal.options.projectId,
 				pid: typeof process !== "undefined" ? process.pid : undefined,
 				flows: internal.options.flows ?? undefined,
+				clientId: internal.options.clientId ?? undefined,
 			}),
 		);
 	} catch (err) {
