@@ -1,6 +1,6 @@
 {
   "name": "@unicorn-studio/snap-bridge",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Tiny RN dev-dep that exposes the running app's nav state to the Unicorn Capture desktop tool over WebSocket. Framework-agnostic — caller pushes route/state via setSnapState.",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
@@ -12,6 +12,10 @@
     "./expo-router": {
       "types": "./src/expo-router.ts",
       "default": "./src/expo-router.ts"
+    },
+    "./react-navigation": {
+      "types": "./src/react-navigation.ts",
+      "default": "./src/react-navigation.ts"
     },
     "./tour": {
       "types": "./src/tour.tsx",

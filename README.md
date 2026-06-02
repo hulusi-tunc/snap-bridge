@@ -45,31 +45,59 @@ That's it. The desktop tool will see the route as you navigate.
 
 ## Use (react-navigation example)
 
-```ts
-import { NavigationContainer, useNavigationContainerRef } from "@react-navigation/native";
-import { installSnapBridge, setSnapState } from "@unicorn-studio/snap-bridge";
+Use the adapter hook — pass it the same ref you give `<NavigationContainer>`
+and it auto-syncs the focused route on every navigation change:
 
-installSnapBridge({ projectId: "your-project" });
+```tsx
+import { NavigationContainer, useNavigationContainerRef } from "@react-navigation/native";
+import { installSnapBridge } from "@unicorn-studio/snap-bridge";
+import { useSnapAutoSync } from "@unicorn-studio/snap-bridge/react-navigation";
+import { snapFlows } from "./snap-flows"; // optional
+
+installSnapBridge({ projectId: "your-project", flows: snapFlows });
 
 export function App() {
-  const ref = useNavigationContainerRef();
+  const navigationRef = useNavigationContainerRef();
+  useSnapAutoSync(navigationRef);          // ← that's it
   return (
-    <NavigationContainer
-      ref={ref}
-      onStateChange={() => {
-        const route = ref.getCurrentRoute();
-        if (!route) return;
-        setSnapState({
-          route: "/" + route.name,
-          navStack: ref.getRootState()?.routes.map((r) => r.name) ?? [],
-        });
-      }}
-    >
-      {/* ... */}
+    <NavigationContainer ref={navigationRef}>
+      {/* ...your navigators */}
     </NavigationContainer>
   );
 }
 ```
+
+The adapter walks the nav state to the focused leaf and pushes a
+`/Tabs/News/Article`-style `route` (with the leaf's params in `extras`).
+React Navigation screen names are stable, so the path doubles as the
+`routePattern` — Capture collapses e.g. every `DocDetail` into one flow.
+
+No ref? Spread the observer onto the container instead:
+
+```tsx
+import { snapNavObserver } from "@unicorn-studio/snap-bridge/react-navigation";
+
+<NavigationContainer {...snapNavObserver()}>{/* ... */}</NavigationContainer>;
+```
+
+### Home-rolled navigation (custom tab state, no NavigationContainer)
+
+If your app drives top-level navigation with its own state (a tab context, a
+phase machine) and only uses React Navigation for nested stacks, the adapter
+can't observe the part that isn't a container. Push that state directly from
+your nav source — e.g. from a tab-context effect:
+
+```ts
+import { setSnapState, setSnapStateContext } from "@unicorn-studio/snap-bridge";
+
+// when the active tab changes:
+setSnapState({ route: `/${activeTab}`, navStack: [activeTab] });
+// app-level dimensions (drives stateHash):
+setSnapStateContext({ role });
+```
+
+You can combine both: `useSnapAutoSync` on each nested container, plus
+`setSnapState` from your tab/phase source for the shell.
 
 ## On a physical device
 
